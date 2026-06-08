@@ -11,7 +11,14 @@ logging.basicConfig(
 
 logger = logging.getLogger("main")
 
-from mc_pricing.gbm_kernel import monte_carlo_european_gpu, monte_carlo_european_cpu
+from mc_pricing.gbm_kernel import (
+    monte_carlo_european_gpu,
+    monte_carlo_european_cpu,
+    monte_carlo_basket_gpu,
+    monte_carlo_basket_cpu,
+    get_gpu_memory_info,
+    compute_optimal_batch_size,
+)
 from mc_pricing.black_scholes import black_scholes_price
 from mc_pricing.implied_vol import newton_raphson_iv
 from mc_pricing.market_data import fetch_option_chain, generate_synthetic_market_data
@@ -24,9 +31,32 @@ from mc_pricing.visualization import (
 )
 
 
-def run_monte_carlo_pricing():
+def run_gpu_memory_diagnostics():
     logger.info("=" * 70)
-    logger.info("  PHASE 1: GPU-Accelerated Monte Carlo European Option Pricing")
+    logger.info("  PHASE 0: GPU Memory Diagnostics & Batch Sizing")
+    logger.info("=" * 70)
+
+    mem_info = get_gpu_memory_info()
+    if mem_info['total_mb'] > 0:
+        logger.info(f"  GPU VRAM: {mem_info['free_mb']:.0f}MB free / {mem_info['total_mb']:.0f}MB total "
+                    f"({mem_info['used_mb']:.0f}MB used)")
+
+        for n_assets in [1, 5, 10, 20, 50]:
+            bs = compute_optimal_batch_size(n_assets=n_assets, n_steps=252, free_vram_mb=mem_info['free_mb'])
+            vram_per_batch = bs * n_assets * 8 * 3 / (1024**2)
+            logger.info(f"  n_assets={n_assets:>2d} → batch_size={bs:>7,} paths | "
+                        f"working set ≈ {vram_per_batch:.1f}MB/batch-step")
+    else:
+        logger.info("  No GPU detected — CPU fallback mode active")
+        logger.info("  Batch processing still applies on CPU (memory-adaptive)")
+
+    return mem_info
+
+
+def run_monte_carlo_pricing():
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("  PHASE 1: Batched Monte Carlo European Option Pricing")
     logger.info("=" * 70)
 
     S0 = 100.0
@@ -70,15 +100,100 @@ def run_monte_carlo_pricing():
     output_dir = os.path.join(os.path.dirname(__file__), 'output')
     os.makedirs(output_dir, exist_ok=True)
 
-    fig_conv = plot_mc_convergence(mc_call, bs_call, title="Call Option — MC vs Black-Scholes")
-    fig_conv.write_html(os.path.join(output_dir, 'mc_convergence_call.html'))
-    logger.info("Saved: mc_convergence_call.html")
-
-    fig_dist = plot_price_distribution(mc_call, S0, K, T, r, sigma, 'call')
-    fig_dist.write_html(os.path.join(output_dir, 'price_distribution_call.html'))
-    logger.info("Saved: price_distribution_call.html")
-
     return mc_call, mc_put, bs_call, bs_put
+
+
+def run_basket_option_pricing():
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("  PHASE 1B: Multi-Asset Basket Option — Batched GPU Pricing")
+    logger.info("=" * 70)
+
+    n_assets = 10
+    np.random.seed(42)
+
+    S0_vec = np.random.uniform(80, 150, n_assets).tolist()
+    weights = np.ones(n_assets) / n_assets
+    sigma_vec = np.random.uniform(0.15, 0.40, n_assets).tolist()
+
+    base_corr = 0.4
+    corr_matrix = base_corr * np.ones((n_assets, n_assets)) + (1 - base_corr) * np.eye(n_assets)
+
+    K = np.dot(S0_vec, weights)
+    T = 0.5
+    r = 0.05
+    N_PATHS = 1_000_000
+    N_STEPS = 126
+
+    logger.info(f"  Basket: {n_assets} assets | K={K:.2f} | T={T} | r={r}")
+    logger.info(f"  S0 range: [{min(S0_vec):.1f}, {max(S0_vec):.1f}]")
+    logger.info(f"  σ range: [{min(sigma_vec):.3f}, {max(sigma_vec):.3f}]")
+    logger.info(f"  Correlation: base={base_corr}")
+    logger.info(f"  Paths: {N_PATHS:,} | Steps: {N_STEPS}")
+
+    mem_before = get_gpu_memory_info()
+
+    basket_result = monte_carlo_basket_gpu(
+        S0_vec, weights, K, T, r, sigma_vec, corr_matrix,
+        n_paths=N_PATHS, n_steps=N_STEPS,
+        option_type='call', rng_seed=42, antithetic=True,
+    )
+
+    mem_after = get_gpu_memory_info()
+
+    logger.info("-" * 70)
+    logger.info(f"  BASKET CALL │ Price: {basket_result['price']:.6f} │ "
+                f"StdErr: {basket_result['std_error']:.6f} │ "
+                f"Time: {basket_result['elapsed_ms']:.2f}ms [{basket_result['device']}]")
+    if mem_after['total_mb'] > 0:
+        vram_delta = mem_after['used_mb'] - mem_before['used_mb']
+        logger.info(f"  VRAM delta: {vram_delta:+.0f}MB | "
+                    f"Peak used: {mem_after['used_mb']:.0f}MB / {mem_after['total_mb']:.0f}MB")
+    logger.info("-" * 70)
+
+    memory_comparison(basket_result, N_PATHS, N_STEPS, n_assets)
+
+    return basket_result
+
+
+def memory_comparison(result, n_paths, n_steps, n_assets):
+    logger.info("")
+    logger.info("  ┌─────────────────────────────────────────────────────────────┐")
+    logger.info("  │          MEMORY FOOTPRINT COMPARISON                        │")
+    logger.info("  ├─────────────────────────────────────────────────────────────┤")
+
+    legacy_rng_bytes = n_paths * n_steps * n_assets * 8
+    legacy_full_bytes = n_paths * (n_steps + 1) * n_assets * 8
+    legacy_total = (legacy_rng_bytes + legacy_full_bytes) / (1024**3)
+    logger.info(f"  │ LEGACY (monolithic):                                       │")
+    logger.info(f"  │   RNG pool:    {legacy_rng_bytes/(1024**3):.3f} GB  "
+                f"({n_paths:,} × {n_steps} × {n_assets} × 8B)      │")
+    logger.info(f"  │   Price array: {legacy_full_bytes/(1024**3):.3f} GB  "
+                f"({n_paths:,} × {n_steps+1} × {n_assets} × 8B)    │")
+    logger.info(f"  │   TOTAL:       {legacy_total:.3f} GB                               │")
+
+    optimal_bs = compute_optimal_batch_size(
+        n_assets=n_assets, n_steps=n_steps,
+        free_vram_mb=get_gpu_memory_info().get('free_mb', 24000)
+    )
+    batched_rng_bytes = optimal_bs * 1 * n_assets * 8
+    batched_logS_bytes = optimal_bs * n_assets * 8
+    batched_result_bytes = n_paths * n_assets * 8
+    batched_total = (batched_rng_bytes + batched_logS_bytes + batched_result_bytes) / (1024**3)
+    logger.info(f"  │                                                             │")
+    logger.info(f"  │ BATCHED (streaming):                                        │")
+    logger.info(f"  │   RNG per step: {batched_rng_bytes/(1024**2):.1f} MB  "
+                f"({optimal_bs:,} × 1 × {n_assets} × 8B)           │")
+    logger.info(f"  │   log_S state:  {batched_logS_bytes/(1024**2):.1f} MB  "
+                f"({optimal_bs:,} × {n_assets} × 8B)              │")
+    logger.info(f"  │   Result ST:    {batched_result_bytes/(1024**2):.1f} MB  "
+                f"({n_paths:,} × {n_assets} × 8B)          │")
+    logger.info(f"  │   PEAK TOTAL:   {batched_total:.3f} GB                              │")
+    logger.info(f"  │                                                             │")
+    reduction = (1 - batched_total / legacy_total) * 100 if legacy_total > 0 else 0
+    logger.info(f"  │ VRAM REDUCTION: {reduction:.1f}%  "
+                f"({legacy_total:.3f}GB → {batched_total:.3f}GB)                │")
+    logger.info(f"  └─────────────────────────────────────────────────────────────┘")
 
 
 def run_implied_volatility_solver():
@@ -172,11 +287,13 @@ def run_volatility_surface():
 def main():
     logger.info("╔══════════════════════════════════════════════════════════════════════╗")
     logger.info("║   Options Pricing & Volatility Surface Analysis Platform            ║")
-    logger.info("║   GPU-Accelerated Monte Carlo │ Newton-Raphson IV │ 3D Visualization ║")
+    logger.info("║   GPU-Batched Monte Carlo │ Newton-Raphson IV │ 3D Visualization    ║")
     logger.info("╚══════════════════════════════════════════════════════════════════════╝")
     logger.info("")
 
+    run_gpu_memory_diagnostics()
     mc_call, mc_put, bs_call, bs_put = run_monte_carlo_pricing()
+    basket_result = run_basket_option_pricing()
     recovered_iv = run_implied_volatility_solver()
     vs = run_volatility_surface()
 
@@ -186,12 +303,14 @@ def main():
     logger.info("=" * 70)
     logger.info("")
     logger.info("  Generated Files:")
-    logger.info("    📊 mc_convergence_call.html     — MC vs BS convergence dashboard")
-    logger.info("    📊 price_distribution_call.html  — Terminal price & payoff distributions")
     logger.info("    📊 volatility_surface_3d.html    — 3D implied volatility surface")
     logger.info("    📊 volatility_smile_slices.html  — Volatility smile cross-sections")
     logger.info("")
-    logger.info("  Open the HTML files in a browser to explore interactive visualizations.")
+    logger.info("  Architecture Highlights:")
+    logger.info("    ✅ Batched streaming GPU kernel — no OOM on large baskets")
+    logger.info("    ✅ Step-by-step RNG consumption — constant VRAM per time step")
+    logger.info("    ✅ Auto batch-size detection — adapts to available GPU memory")
+    logger.info("    ✅ Multi-asset basket options — Cholesky-correlated GBM paths")
 
 
 if __name__ == '__main__':
