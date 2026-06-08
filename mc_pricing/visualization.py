@@ -352,3 +352,202 @@ def plot_volatility_smile_slices(surface_data, slices_at_days=[30, 90, 180, 365]
     )
 
     return fig
+
+
+def plot_early_exercise_boundary(american_result, K, S0, option_type='put',
+                                  comparison_results=None,
+                                  title="American Option — Free Boundary (Optimal Exercise Curve)"):
+    boundary_times, boundary_prices = american_result['early_exercise_boundary']
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=boundary_times * 365,
+        y=boundary_prices,
+        mode='lines',
+        name='Early Exercise Boundary',
+        line=dict(color='#ff4444', width=3),
+        hovertemplate='Time to Expiry: %{x:.1f} days<br>Boundary S*: %{y:.2f}<extra></extra>',
+    ))
+
+    if option_type.lower() == 'put':
+        fig.add_hline(
+            y=K,
+            line_dash="dash",
+            line_color="#ffaa00",
+            line_width=1.5,
+            annotation_text=f"K = {K}",
+            annotation_font=dict(size=13, color="#ffaa00"),
+        )
+
+        fig.add_annotation(
+            x=boundary_times[len(boundary_times) // 2] * 365,
+            y=(K + boundary_prices.min()) / 2,
+            text="EXERCISE<br>REGION",
+            showarrow=False,
+            font=dict(size=16, color='#ff6666', family='Arial Black'),
+        )
+
+        fig.add_annotation(
+            x=boundary_times[len(boundary_times) // 2] * 365,
+            y=(boundary_prices.max() + boundary_prices[len(boundary_times) // 2]) / 2 + 10,
+            text="HOLD<br>REGION",
+            showarrow=False,
+            font=dict(size=16, color='#44ff44', family='Arial Black'),
+        )
+    else:
+        fig.add_hline(
+            y=K,
+            line_dash="dash",
+            line_color="#ffaa00",
+            line_width=1.5,
+            annotation_text=f"K = {K}",
+            annotation_font=dict(size=13, color="#ffaa00"),
+        )
+
+    if comparison_results is not None:
+        amer_price = comparison_results['american']['price']
+        euro_price = comparison_results['european_bs']
+        premium = comparison_results['early_premium']
+
+        stats_text = (
+            f"<b>Pricing Summary</b><br>"
+            f"American (PDE): {amer_price:.4f}<br>"
+            f"European (BS): {euro_price:.4f}<br>"
+            f"Early Premium: {premium:.4f} ({premium/amer_price*100:.2f}%)"
+        )
+
+        fig.add_annotation(
+            x=0.98, y=0.98,
+            text=stats_text,
+            showarrow=False,
+            font=dict(size=13, color='white', family='Consolas'),
+            align='right',
+            bordercolor='gray',
+            borderwidth=1,
+            borderpad=10,
+            bgcolor='rgba(20,20,50,0.9)',
+            xref='paper', yref='paper',
+        )
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=20, color='white'),
+            x=0.5,
+        ),
+        xaxis=dict(
+            title=dict(text='Time to Expiry (Days)', font=dict(size=14, color='white')),
+            gridcolor='rgba(128,128,128,0.3)',
+            tickfont=dict(color='lightgray'),
+        ),
+        yaxis=dict(
+            title=dict(text='Stock Price S*', font=dict(size=14, color='white')),
+            gridcolor='rgba(128,128,128,0.3)',
+            tickfont=dict(color='lightgray'),
+        ),
+        paper_bgcolor='rgba(10,10,30,0.95)',
+        plot_bgcolor='rgba(10,10,40,0.9)',
+        font=dict(color='white'),
+        width=1200,
+        height=700,
+        legend=dict(font=dict(size=12, color='white'), bgcolor='rgba(20,20,50,0.8)'),
+    )
+
+    return fig
+
+
+def plot_pde_price_profile(american_result, euro_result, K, S0, option_type='put',
+                            title="PDE Option Value Profile — American vs European"):
+    S = american_result['grid_S']
+    V_amer = american_result['grid_V']
+    V_euro = euro_result['grid_V']
+
+    if option_type.lower() == 'put':
+        intrinsic = np.maximum(K - S, 0)
+    else:
+        intrinsic = np.maximum(S - K, 0)
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=S,
+        y=V_amer,
+        mode='lines',
+        name='American (PDE)',
+        line=dict(color='#00ccff', width=2.5),
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=S,
+        y=V_euro,
+        mode='lines',
+        name='European (PDE)',
+        line=dict(color='#44ff44', width=2, dash='dash'),
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=S,
+        y=intrinsic,
+        mode='lines',
+        name='Intrinsic Value',
+        line=dict(color='#ff6644', width=1.5, dash='dot'),
+    ))
+
+    fig.add_vline(
+        x=S0,
+        line_dash="solid",
+        line_color="rgba(255,255,255,0.4)",
+        line_width=1,
+        annotation_text=f"S₀={S0}",
+        annotation_font=dict(size=12, color='lightgray'),
+    )
+
+    amer_at_s0 = np.interp(S0, S, V_amer)
+    euro_at_s0 = np.interp(S0, S, V_euro)
+    premium = amer_at_s0 - euro_at_s0
+
+    fig.add_annotation(
+        x=0.98, y=0.6,
+        text=(
+            f"<b>At S₀={S0}</b><br>"
+            f"American: {amer_at_s0:.4f}<br>"
+            f"European: {euro_at_s0:.4f}<br>"
+            f"Premium: {premium:.4f}"
+        ),
+        showarrow=False,
+        font=dict(size=13, color='white', family='Consolas'),
+        align='right',
+        bordercolor='gray',
+        borderwidth=1,
+        borderpad=10,
+        bgcolor='rgba(20,20,50,0.9)',
+        xref='paper', yref='paper',
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=20, color='white'),
+            x=0.5,
+        ),
+        xaxis=dict(
+            title=dict(text='Stock Price (S)', font=dict(size=14, color='white')),
+            gridcolor='rgba(128,128,128,0.3)',
+            tickfont=dict(color='lightgray'),
+            range=[0, K * 2.5],
+        ),
+        yaxis=dict(
+            title=dict(text='Option Value', font=dict(size=14, color='white')),
+            gridcolor='rgba(128,128,128,0.3)',
+            tickfont=dict(color='lightgray'),
+        ),
+        paper_bgcolor='rgba(10,10,30,0.95)',
+        plot_bgcolor='rgba(10,10,40,0.9)',
+        font=dict(color='white'),
+        width=1200,
+        height=600,
+        legend=dict(font=dict(size=12, color='white'), bgcolor='rgba(20,20,50,0.8)'),
+    )
+
+    return fig

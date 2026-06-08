@@ -23,11 +23,19 @@ from mc_pricing.black_scholes import black_scholes_price
 from mc_pricing.implied_vol import newton_raphson_iv
 from mc_pricing.market_data import fetch_option_chain, generate_synthetic_market_data
 from mc_pricing.vol_surface import VolatilitySurface
+from mc_pricing.pde_solver import (
+    crank_nicolson_american,
+    crank_nicolson_european,
+    dupire_local_volatility,
+    compare_american_european,
+)
 from mc_pricing.visualization import (
     plot_volatility_surface_3d,
     plot_mc_convergence,
     plot_price_distribution,
     plot_volatility_smile_slices,
+    plot_early_exercise_boundary,
+    plot_pde_price_profile,
 )
 
 
@@ -284,10 +292,102 @@ def run_volatility_surface():
     return vs
 
 
+def run_american_option_pde(vs=None):
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("  PHASE 4: American Option PDE Pricing — Crank-Nicolson + Free Boundary")
+    logger.info("=" * 70)
+
+    S0 = 100.0
+    K = 100.0
+    T = 1.0
+    r = 0.05
+    sigma = 0.20
+
+    output_dir = os.path.join(os.path.dirname(__file__), 'output')
+    os.makedirs(output_dir, exist_ok=True)
+
+    logger.info("")
+    logger.info("  ── Part A: Constant-Vol American Put ──")
+    comparison = compare_american_european(S0, K, T, r, sigma, 'put', n_S=400, n_t=1000)
+
+    amer_result = comparison['american']
+    euro_result = comparison['european_pde']
+
+    fig_boundary = plot_early_exercise_boundary(
+        amer_result, K, S0, 'put',
+        comparison_results=comparison,
+        title="American Put — Free Boundary (Constant σ=20%)",
+    )
+    fig_boundary.write_html(os.path.join(output_dir, 'american_free_boundary.html'))
+    logger.info("Saved: american_free_boundary.html")
+
+    fig_profile = plot_pde_price_profile(
+        amer_result, euro_result, K, S0, 'put',
+        title="PDE Price Profile — American vs European Put (σ=20%)",
+    )
+    fig_profile.write_html(os.path.join(output_dir, 'american_vs_european_profile.html'))
+    logger.info("Saved: american_vs_european_profile.html")
+
+    logger.info("")
+    logger.info("  ── Part B: Multi-Strike American Put Scan ──")
+    logger.info(f"  {'K':>8s}  {'American':>12s}  {'European':>12s}  {'Premium':>10s}  {'% Prem':>8s}  {'S* at t=0':>10s}")
+    logger.info("  " + "-" * 66)
+
+    for K_test in [90, 95, 100, 105, 110]:
+        comp = compare_american_european(S0, K_test, T, r, sigma, 'put', n_S=300, n_t=800)
+        amer_p = comp['american']['price']
+        euro_p = comp['european_bs']
+        prem = comp['early_premium']
+        pct = prem / amer_p * 100 if amer_p > 0 else 0
+
+        bt, bp = comp['american']['early_exercise_boundary']
+        s_star = bp[-1] if len(bp) > 0 else 0
+
+        logger.info(f"  {K_test:>8.1f}  {amer_p:>12.6f}  {euro_p:>12.6f}  {prem:>10.6f}  {pct:>7.2f}%  {s_star:>10.2f}")
+
+    local_vol_func = None
+    if vs is not None and vs.surface_spline is not None:
+        logger.info("")
+        logger.info("  ── Part C: Local-Vol American Put (Dupire from IV Surface) ──")
+
+        loc_vol_data = dupire_local_volatility(vs, S0=S0, r=r, n_strikes=50, n_expiries=30)
+
+        if loc_vol_data is not None and loc_vol_data['loc_vol_spline'] is not None:
+            lv_spline = loc_vol_data['loc_vol_spline']
+
+            def local_vol_func(S_val, t_val):
+                try:
+                    result = float(lv_spline(max(t_val, 1/365), S_val).item())
+                    return np.clip(result, 0.05, 2.0)
+                except Exception:
+                    return sigma
+
+            comp_lv = compare_american_european(
+                S0, K, T, r, sigma, 'put',
+                n_S=300, n_t=800,
+                local_vol_func=local_vol_func,
+            )
+
+            amer_lv = comp_lv['american']
+            fig_boundary_lv = plot_early_exercise_boundary(
+                amer_lv, K, S0, 'put',
+                comparison_results=comp_lv,
+                title="American Put — Free Boundary (Dupire Local Vol)",
+            )
+            fig_boundary_lv.write_html(os.path.join(output_dir, 'american_free_boundary_localvol.html'))
+            logger.info("Saved: american_free_boundary_localvol.html")
+        else:
+            logger.warning("Local volatility extraction failed, skipping Part C")
+
+    logger.info("-" * 70)
+    return amer_result
+
+
 def main():
     logger.info("╔══════════════════════════════════════════════════════════════════════╗")
     logger.info("║   Options Pricing & Volatility Surface Analysis Platform            ║")
-    logger.info("║   GPU-Batched Monte Carlo │ Newton-Raphson IV │ 3D Visualization    ║")
+    logger.info("║   GPU-Batched MC │ PDE American │ Newton-Raphson IV │ 3D Visualization ║")
     logger.info("╚══════════════════════════════════════════════════════════════════════╝")
     logger.info("")
 
@@ -296,6 +396,7 @@ def main():
     basket_result = run_basket_option_pricing()
     recovered_iv = run_implied_volatility_solver()
     vs = run_volatility_surface()
+    amer_result = run_american_option_pde(vs)
 
     logger.info("")
     logger.info("=" * 70)
@@ -303,14 +404,19 @@ def main():
     logger.info("=" * 70)
     logger.info("")
     logger.info("  Generated Files:")
-    logger.info("    📊 volatility_surface_3d.html    — 3D implied volatility surface")
-    logger.info("    📊 volatility_smile_slices.html  — Volatility smile cross-sections")
+    logger.info("    📊 volatility_surface_3d.html              — 3D IV surface")
+    logger.info("    📊 volatility_smile_slices.html            — IV smile slices")
+    logger.info("    📊 american_free_boundary.html             — American put free boundary")
+    logger.info("    📊 american_vs_european_profile.html       — PDE price profile")
+    logger.info("    📊 american_free_boundary_localvol.html    — Free boundary (Dupire LV)")
     logger.info("")
     logger.info("  Architecture Highlights:")
     logger.info("    ✅ Batched streaming GPU kernel — no OOM on large baskets")
     logger.info("    ✅ Step-by-step RNG consumption — constant VRAM per time step")
     logger.info("    ✅ Auto batch-size detection — adapts to available GPU memory")
     logger.info("    ✅ Multi-asset basket options — Cholesky-correlated GBM paths")
+    logger.info("    ✅ Crank-Nicolson PDE solver — American option free boundary")
+    logger.info("    ✅ Dupire local volatility — from implied vol surface to LV grid")
 
 
 if __name__ == '__main__':
